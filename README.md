@@ -15,15 +15,22 @@ Library:
     to talk to;
   - `tapi_sniffrules` — ready-made rules over captured traffic for the
     usual protocol mistakes;
+  - `tapi_objdump` — what is actually in the code, through binutils;
+  - `tapi_frida` — what the code actually does, and making it take the
+    path it will not take by itself;
   - `tapi_cybersec.h` — the finding and report model they share.
 
 It builds on [tsf-kernel](https://github.com/interpretica-io/tsf-kernel)
-(which builds on
-[tsf-devtool](https://github.com/interpretica-io/tsf-devtool)) for
-reading the files of kernel interfaces on the agent.
+and [tsf-devtool](https://github.com/interpretica-io/tsf-devtool), for
+reading kernel interfaces and for running tools on an agent.
 
-Everything here reads state and reports. Nothing changes the device, and
-nothing exploits what it finds.
+The scanners read state and report; nothing here changes the device or
+exploits what it finds. The two reverse engineering tools are the
+exception that proves the rule: Frida does change the process it is
+attached to, deliberately, and it is test equipment in exactly the sense
+the kernel probes of tsf-kernel are — it never ships with the product,
+it runs on a lab machine, and it exists to make a defect observable so
+that it can be closed.
 
 ## Usage
 
@@ -236,9 +243,114 @@ Four things about how the rules behave:
 The capture needs TAD built with the Ethernet and IP stack layers; see
 the `TE_LIB_PARMS` line above.
 
+## tapi_objdump — what is in the code
+
+`tapi_binscan` answers how a binary was built by reading its ELF
+structure. This answers what is actually in the code, through binutils.
+They do not overlap: symbols and headers come from the ELF reader, which
+needs nothing installed anywhere; disassembly comes from here.
+
+```c
+tapi_objdump_opt opt = tapi_objdump_default_opt;
+
+opt.path = "/usr/sbin/dutd";
+CHECK_RC(tapi_objdump_check_banned(factory, &opt, NULL,
+                                   TAPI_DEVTOOL_TIMEOUT_MS, &report));
+```
+
+The disassembly is walked keeping track of which function each line
+belongs to, so a finding names the caller — which is what makes it
+actionable. `tapi_objdump_default_banned` is the list: the functions
+with no bound on what they write, the ones that hand a string to a
+shell, predictable randomness, and guessable temporary names.
+
+It reports a *reference*, not a proven call: a reference inside a branch
+that never runs still shows up. Confirming that it runs is what Frida is
+for, and the two share the same list of names on purpose.
+
+`objdump` runs on the agent behind the factory and reads a path on that
+agent. For a device with no binutils — the usual case — copy the binary
+to an agent that has them with `tapi_file_copy_ta()` first; an agent on
+the engine host will do, and for a cross target it is the one place the
+cross binutils are. Name the toolchain and the `objdump` of its
+`cross_compile` prefix is used.
+
+## tapi_frida — what the code does
+
+```c
+tapi_frida_opt opt = tapi_frida_default_opt;
+te_string script = TE_STRING_INIT;
+te_string path = TE_STRING_INIT;
+tapi_frida_app *app = NULL;
+
+tapi_frida_script_trace_calls(tapi_objdump_default_banned, &script);
+CHECK_RC(tapi_frida_script_put(ta, script.ptr, &path));
+
+opt.target_name = "dutd";
+opt.script_path = path.ptr;
+
+CHECK_RC(tapi_frida_create(factory, &opt, &app));
+CHECK_RC(tapi_frida_start(app));
+... drive the device under test ...
+CHECK_RC(tapi_frida_stop(app));
+CHECK_RC(tapi_frida_check_banned_calls(app, &report));
+```
+
+Four scripts are generated for you, and they are ordinary Frida
+JavaScript — read them, change them, or write your own and pass the path:
+
+| Script | What it does |
+|---|---|
+| `tapi_frida_script_trace_calls()` | reports every call to a list of functions, with the call site from the backtrace |
+| `tapi_frida_script_fail_call()` | replaces the return value of the *n*th call and sets `errno`, so the error path nobody exercises gets exercised |
+| `tapi_frida_script_trace_open()` | reports every file the target opens, through `open`, `open64`, `openat` and `fopen` |
+| `tapi_frida_script_trace_connect()` | reports every address the target connects to |
+
+Each prints lines with a stable prefix, which `tapi_frida_events()`
+collects back into records. Two checks turn those into findings:
+`tapi_frida_check_banned_calls()`, and `tapi_frida_check_egress()`,
+which takes the same `tapi_egress_policy` as the socket-table scanner
+and the traffic rules. That last one sees what the socket table can
+miss: a connection opened and closed between two snapshots still shows
+up.
+
+`tapi_frida_script_fail_call()` is the userspace twin of the kernel
+fault-injection probe: the kernel's own mechanisms cannot reach a
+`malloc` inside one process, and a test that never makes an allocation
+fail never learns what happens when one does.
+
+Frida injects itself into the target. It changes timing, it can crash
+the process, and attaching needs permission to `ptrace` — on a hardened
+kernel `kernel.yama.ptrace_scope` refuses it, which
+`tapi_kernel_security_posture_get()` will have recorded. Check it is
+there at all with `tapi_frida_check_available()` and `TEST_SKIP` when it
+is not.
+
+The generated scripts are written for Linux and glibc or musl: they read
+`sockaddr` the way Linux lays it out and set `errno` through
+`__errno_location`.
+
+## Static and dynamic together
+
+The two tools answer different halves of one question, and a test that
+uses both gets a result neither gives alone:
+
+| | `tapi_objdump` | `tapi_frida` |
+|---|---|---|
+| needs | binutils on some agent | `frida` on the agent, `frida-server` on the DUT, `ptrace` allowed |
+| target | the file | the running process |
+| a `strcpy` finding means | the binary references it | it ran, from here, during this test |
+| finding | `binary.banned-call`, MEDIUM | `runtime.banned-call`, HIGH |
+
+Run the static check over every shipped binary, and the dynamic one over
+the handful of paths the test can actually drive. A static finding the
+dynamic run confirms is a defect with a reproducer; one it does not
+reach is still worth fixing, but it is not the one to fix first.
+
 ## Scope
 
-These scanners point at the agents and addresses the suite's own
-configuration describes. That is the engagement they belong to; pointing
-them anywhere else is outside it. The traffic rules want a lab network
-where every party is part of that engagement.
+These scanners point at the agents, binaries and addresses the suite's
+own configuration describes. That is the engagement they belong to;
+pointing them anywhere else is outside it. The traffic rules want a lab
+network where every party is part of that engagement, and Frida wants a
+machine you are allowed to crash.
