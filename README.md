@@ -35,7 +35,7 @@ that it can be closed.
 ## Usage
 
 Declare the repositories in an external libraries catalog and pass it to
-`dispatcher.sh --ext-libs=ext-libs.yml`:
+`dispatcher.sh --external=external.yml`:
 
 ```yaml
 repositories:
