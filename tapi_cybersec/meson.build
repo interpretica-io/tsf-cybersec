@@ -3,16 +3,24 @@
 #
 # External TE library (see TE_EXT_REPO): engine-side security scanners -
 # binary hardening, network exposure, outgoing connections, rules over
-# captured traffic, and the reverse engineering tools. Built as a shared
-# library on the engine platform and as a static library when agents or
-# agent apps are built.
+# captured traffic, and the reverse engineering tools. Built as a
+# shared library on the engine platform; see below for why there is no
+# static one.
 
 if get_option('engine')
     build_lib_shared = true
 endif
-build_lib_static = not get_option('engine') \
-    or get_option('agents').split().length() != 0 \
-    or get_option('agent-apps').split().length() != 0
+# Shared on the engine and nothing on an agent, which is the rule TE
+# applies to its own engine-side libraries. The default for an external
+# repository is the opposite - lib/meson.build builds one static and
+# agent-side, because that is what external libraries used to be - and
+# the obvious override, "static as well when there are agents", is the
+# rule for a library that lives on both sides. This one does not: it
+# calls tapi and tapi_job, which are engine libraries with no static
+# variant, so asking for a static build of it fails the configure with
+# "Tried to get unknown variable dep_lib_static_tapi" before a line is
+# compiled.
+build_lib_static = false
 install_lib = install_dev
 
 headers += files(
